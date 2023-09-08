@@ -5,6 +5,7 @@ import javazoom.jl.player.NullAudioDevice;
 import support.PlayerWindow;
 import support.Song;
 
+import javax.swing.*;
 import javax.swing.event.MouseInputAdapter;
 import java.awt.*;
 import java.awt.event.ActionListener;
@@ -12,6 +13,7 @@ import java.awt.event.MouseEvent;
 
 import java.io.FileNotFoundException;
 import java.util.ArrayList;
+import java.util.concurrent.locks.ReentrantLock;
 
 public class Player {
 
@@ -33,129 +35,208 @@ public class Player {
     private int songIndex;
     private Song songPlaying;
 
+    private ReentrantLock lock = new ReentrantLock();
+
     // Estruturas que guardam informações das músicas na fila
     private ArrayList<String[]> musicArray = new ArrayList<>();
     private String[][] musicQueue;
-
-    // Fila de músicas para a reprodução
     private  ArrayList<Song> reproductionQueue = new ArrayList<>();
 
-    // Variavéis de estado
-    private int playButtonState = 1;
-    private boolean playing = false;
+    // Variáveis de estado
+    private int playingState = 0;
+
+    private boolean nextSong = false;
+    private boolean previousSong = false;
+    private boolean stopMusic = false;
+    private boolean removeCurrentSong = false;
+
+    // Auxiliares
+    int skipTime;
 
     private Thread playerThread;
-
+    private Thread scrubberUpdate;
 
     private final ActionListener buttonListenerPlayNow = e -> {
-        if (bitstream != null) {
+        if (playerThread != null) {
             playerThread.interrupt();
-            closeObjects();
         }
-
-        playerThread = new Thread (() -> {
-            playButtonState = 1;
-            playing = true;
-
+        playerThread = new Thread(() -> {
             songIndex = this.window.getSelectedSongIndex();
-            songPlaying = reproductionQueue.get(songIndex);
-            this.window.setPlayingSongInfo(songPlaying.getTitle(), songPlaying.getAlbum(), songPlaying.getArtist());
 
-            startObjects();
-
-            boolean continuePlaying = true;
-            while (continuePlaying && !playerThread.isInterrupted()) {
-                if (playing) {
-                    setBeginningButtons();
-                    this.window.setTime((currentFrame * (int) songPlaying.getMsPerFrame()), (int) songPlaying.getMsLength());
-                    try {
-                        playNextFrame();
-                    } catch (JavaLayerException ex) {
-                        throw new RuntimeException(ex);
-                    }
-                    currentFrame++;
+            while (songIndex < reproductionQueue.size() && !playerThread.isInterrupted()) {
+                lock.lock();
+                try {
+                    currentFrame = 0;
+                    playingState = 1;
+                } finally {
+                    lock.unlock();
                 }
-                continuePlaying = currentFrame < songPlaying.getNumFrames();
 
-                if (!continuePlaying) {
-                    playerThread.interrupt();
-                    closeObjects();
-                    resetButtons();
-                    playing = false;
+                songPlaying = reproductionQueue.get(songIndex);
+
+                closeObjects();
+                startObjects();
+
+                EventQueue.invokeLater(() -> {
+                    this.window.setPlayPauseButtonIcon(playingState);
+                    this.window.setEnabledPlayPauseButton(true);
+                    this.window.setEnabledStopButton(true);
+                    this.window.setEnabledScrubber(bitstream != null);
+                    this.window.setEnabledPreviousButton((bitstream != null) && songIndex > 0);
+                    this.window.setEnabledNextButton((bitstream != null) && songIndex < reproductionQueue.size() - 1);
+                    this.window.setEnabledShuffleButton(false);
+                    this.window.setEnabledLoopButton(false);
+                    this.window.setPlayingSongInfo(songPlaying.getTitle(), songPlaying.getAlbum(), songPlaying.getArtist());
+                });
+
+                boolean continuePlaying = currentFrame < songPlaying.getNumFrames();
+                while (continuePlaying && !playerThread.isInterrupted()) {
+                    if (playingState == 1) {
+                        lock.lock();
+                        try {
+                            continuePlaying = playNextFrame();
+                            currentFrame++;
+                        } catch (JavaLayerException ex) {
+                            throw new RuntimeException(ex);
+                        } finally {
+                            lock.unlock();
+                        }
+
+                        EventQueue.invokeLater(() -> {
+                            this.window.setTime((currentFrame * (int) songPlaying.getMsPerFrame()), (int) songPlaying.getMsLength());
+                        });
+                    }
+
+                    // para a reprodução após algum input externo
+                    if (stopMusic || removeCurrentSong || nextSong || previousSong) {
+                        continuePlaying = false;
+                    }
+                }
+
+                lock.lock();
+                try {
+                    if (stopMusic) {
+                        songIndex = reproductionQueue.size();
+                    } else if (nextSong) {
+                        songIndex++;
+                    } else if (previousSong) {
+                        songIndex--;
+                    } else if (!removeCurrentSong) {
+                        songIndex++;
+                    }
+
+                    previousSong = false;
+                    nextSong = false;
+                    removeCurrentSong = false;
+                    stopMusic = false;
+                    playingState = 0;
+                } finally {
+                    lock.unlock();
+                }
+
+                // reset após a última música da lista de reprodução ser tocada
+                if (songIndex >= reproductionQueue.size() || songIndex < 0) {
+                    resetDisplayInfo();
                 }
             }
-            resetButtons();
+            resetDisplayInfo();
         });
-
         playerThread.start();
     };
 
     private final ActionListener buttonListenerRemove = e -> {
         int removedSong = this.window.getSelectedSongIndex();
 
-        if (removedSong == songIndex && playing) {
-            playing = false;
-            playerThread.interrupt();
-            resetButtons();
-        } else if (songIndex > removedSong) {
-            // Arruma o lugar da música selecionada se uma música antes dela for removida
+        if (removedSong == songIndex && playingState == 1) {      // remoção da música enquanto ela está sendo reproduzida
+            if (songIndex == reproductionQueue.size() - 1) {      // remoção da última música da lista
+                stopMusic = true;
+            } else {
+                removeCurrentSong = true;
+            }
+        } else if (songIndex > removedSong) {                      // arruma o index da música atual se uma música antes dela for removida
             songIndex--;
         }
-
-        songIndex = (songIndex < 0) ? 0 : songIndex;
 
         reproductionQueue.remove(removedSong);
         musicArray.remove(removedSong);
         musicQueue = musicArray.toArray(new String[0][]);
+
+        this.window.setEnabledNextButton(playingState == 1 && songIndex < reproductionQueue.size() - 1);
+        this.window.setEnabledPreviousButton(playingState == 1 && songIndex > 0);
         this.window.setQueueList(musicQueue);
     };
 
     private final ActionListener buttonListenerAddSong = e -> {
         Song newSong = this.window.openFileChooser();
-
         if (newSong != null) {
             musicArray.add(newSong.getDisplayInfo());
             musicQueue = musicArray.toArray(new String[0][]);
             reproductionQueue.add(newSong);
+
+            this.window.setEnabledNextButton(playingState == 1 && songIndex < reproductionQueue.size() - 1);
+            this.window.setEnabledPreviousButton(playingState == 1 && songIndex > 0);
             this.window.setQueueList(musicQueue);
         }
+
     };
 
     private final ActionListener buttonListenerPlayPause = e -> {
-        switch (playButtonState) {
-            case 0:
-                playButtonState = 1;
-                playing = true;
-                break;
-            case 1:
-                playButtonState = 0;
-                playing = false;
-                break;
+        switch (playingState) {
+            case 0 -> playingState = 1;
+            case 1 -> playingState = 0;
         }
-        this.window.setPlayPauseButtonIcon(playButtonState);
+
+        this.window.setPlayPauseButtonIcon(playingState);
     };
 
     private final ActionListener buttonListenerStop = e -> {
-        playing = false;
-        playerThread.interrupt();
-        resetButtons();
+        stopMusic = true;
     };
 
-    private final ActionListener buttonListenerNext = e -> {};
-    private final ActionListener buttonListenerPrevious = e -> {};
+    private final ActionListener buttonListenerNext = e -> {
+        nextSong = true;
+    };
+    private final ActionListener buttonListenerPrevious = e -> {
+        previousSong = true;
+    };
+
     private final ActionListener buttonListenerShuffle = e -> {};
     private final ActionListener buttonListenerLoop = e -> {};
+
     private final MouseInputAdapter scrubberMouseInputAdapter = new MouseInputAdapter() {
         @Override
         public void mouseReleased(MouseEvent e) {
+            scrubberUpdate = new Thread(() -> {
+                EventQueue.invokeLater(() -> {
+                    window.setTime(skipTime * (int) songPlaying.getMsPerFrame(), (int) songPlaying.getMsLength());
+                });
+
+                lock.lock();
+                try {
+                    if (skipTime < currentFrame) {
+                        closeObjects();
+                        startObjects();
+                        currentFrame = 0;
+                    }
+                    skipToFrame(skipTime);
+                } catch (BitstreamException ex) {
+                    throw new RuntimeException(ex);
+                } finally {
+                    lock.unlock();
+                }
+
+            });
+            scrubberUpdate.start();
         }
 
         @Override
         public void mousePressed(MouseEvent e) {
+            skipTime = (int) (window.getScrubberValue() / songPlaying.getMsPerFrame());
         }
 
         @Override
         public void mouseDragged(MouseEvent e) {
+            skipTime = (int) (window.getScrubberValue() / songPlaying.getMsPerFrame());
         }
     };
 
@@ -215,48 +296,46 @@ public class Player {
     }
 
     private void startObjects () {
+        lock.lock();
         try {
             device = FactoryRegistry.systemRegistry().createAudioDevice();
             device.open(decoder = new Decoder());
             bitstream = new Bitstream(songPlaying.getBufferedInputStream());
-        } catch (FileNotFoundException | JavaLayerException ex) {
-            throw new RuntimeException(ex);
+        } catch (FileNotFoundException | JavaLayerException ignored) {
+
+        } finally {
+            lock.unlock();
         }
     }
 
     private void closeObjects () {
-        currentFrame = 0;
-        if (bitstream != null) {
-            try {
+        lock.lock();
+        try {
+            if (bitstream != null) {
                 bitstream.close();
-            } catch (BitstreamException ex) {
-                throw new RuntimeException(ex);
+                device.close();
             }
-            device.close();
+        } catch (BitstreamException ex) {
+            throw new RuntimeException(ex);
+        } finally {
+            lock.unlock();
         }
     }
 
-    private void setBeginningButtons () {
-        this.window.setPlayPauseButtonIcon(playButtonState);
-        this.window.setEnabledPlayPauseButton(true);
-        this.window.setEnabledStopButton(true);
-        this.window.setEnabledScrubber(false);
-        this.window.setEnabledPreviousButton(false);
-        this.window.setEnabledNextButton(false);
-        this.window.setEnabledShuffleButton(false);
-        this.window.setEnabledLoopButton(false);
+    private void resetDisplayInfo () {
+        EventQueue.invokeLater(() -> {
+            this.window.setPlayPauseButtonIcon(playingState);
+            this.window.setEnabledPlayPauseButton(false);
+            this.window.setEnabledStopButton(false);
+            this.window.setEnabledScrubber(false);
+            this.window.setEnabledPreviousButton(false);
+            this.window.setEnabledNextButton(false);
+            this.window.setEnabledShuffleButton(false);
+            this.window.setEnabledLoopButton(false);
+            this.window.resetMiniPlayer();
+        });
     }
 
-    private void resetButtons () {
-        this.window.setPlayPauseButtonIcon(playButtonState);
-        this.window.setEnabledPlayPauseButton(false);
-        this.window.setEnabledStopButton(false);
-        this.window.setEnabledScrubber(false);
-        this.window.setEnabledPreviousButton(false);
-        this.window.setEnabledNextButton(false);
-        this.window.setEnabledShuffleButton(false);
-        this.window.setEnabledLoopButton(false);
-        this.window.resetMiniPlayer();
-    }
+
     //</editor-fold>
 }
